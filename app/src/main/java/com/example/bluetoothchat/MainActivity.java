@@ -5,8 +5,13 @@ import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothServerSocket;
 import android.bluetooth.BluetoothSocket;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
 import android.text.Editable;
@@ -15,7 +20,6 @@ import android.text.Spanned;
 import android.text.TextWatcher;
 import android.text.style.ForegroundColorSpan;
 import android.text.style.StyleSpan;
-import android.graphics.Typeface;
 import android.view.View;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
@@ -32,6 +36,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.UUID;
 
@@ -54,7 +59,7 @@ public class MainActivity extends AppCompatActivity {
     private TextView typingIndicator;
 
     private BluetoothAdapter bluetoothAdapter;
-    private ArrayList<BluetoothDevice> pairedDevicesList = new ArrayList<>();
+    private ArrayList<BluetoothDevice> discoveredDevicesList = new ArrayList<>();
 
     private BluetoothServerSocket serverSocket;
     private BluetoothSocket bluetoothSocket;
@@ -62,6 +67,21 @@ public class MainActivity extends AppCompatActivity {
     private InputStream inputStream;
 
     private long lastTypingSentTime = 0;
+    private boolean permissionsGranted = false;
+
+    private final BroadcastReceiver discoveryReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (BluetoothDevice.ACTION_FOUND.equals(action)) {
+                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                if (device != null && !discoveredDevicesList.contains(device)) {
+                    discoveredDevicesList.add(device);
+                    refreshDeviceListAdapter();
+                }
+            }
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -79,14 +99,17 @@ public class MainActivity extends AppCompatActivity {
 
         bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
 
+        IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_FOUND);
+        registerReceiver(discoveryReceiver, filter);
+
         requestBluetoothPermissions();
-        startListening();
 
         scanButton.setOnClickListener(v -> toggleDeviceList());
 
         deviceList.setOnItemClickListener((AdapterView<?> parent, View view, int position, long id) -> {
             deviceList.setVisibility(View.GONE);
-            connectToDevice(pairedDevicesList.get(position));
+            stopDiscovery();
+            connectToDevice(discoveredDevicesList.get(position));
         });
 
         sendButton.setOnClickListener(v -> sendMessage());
@@ -119,35 +142,67 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    private void requestBluetoothPermissions() {
+        boolean needsRequest;
+        String[] permsToRequest;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            needsRequest = ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED ||
+                    ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED;
+            permsToRequest = new String[]{Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN};
+        } else {
+            needsRequest = ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED;
+            permsToRequest = new String[]{Manifest.permission.ACCESS_FINE_LOCATION};
+        }
+
+        if (needsRequest) {
+            ActivityCompat.requestPermissions(this, permsToRequest, PERMISSION_REQUEST_CODE);
+        } else {
+            permissionsGranted = true;
+            startListening();
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == PERMISSION_REQUEST_CODE) {
+            boolean allGranted = true;
+            for (int result : grantResults) {
+                if (result != PackageManager.PERMISSION_GRANTED) {
+                    allGranted = false;
+                    break;
+                }
+            }
+            if (allGranted && grantResults.length > 0) {
+                permissionsGranted = true;
+                Toast.makeText(this, "Bluetooth permissions granted", Toast.LENGTH_SHORT).show();
+                startListening();
+            } else {
+                permissionsGranted = false;
+                Toast.makeText(this, "Bluetooth permissions are required for this app to work", Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
     private void toggleDeviceList() {
+        if (!permissionsGranted) {
+            Toast.makeText(this, "Bluetooth permission not granted", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
         if (deviceList.getVisibility() == View.VISIBLE) {
             deviceList.setVisibility(View.GONE);
+            stopDiscovery();
             startListening();
         } else {
             stopListening();
-            showPairedDevices();
+            startDiscoveryAndShowDevices();
             deviceList.setVisibility(View.VISIBLE);
         }
     }
 
-    private void requestBluetoothPermissions() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED ||
-                    ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this,
-                        new String[]{Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN},
-                        PERMISSION_REQUEST_CODE);
-            }
-        } else {
-            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this,
-                        new String[]{Manifest.permission.ACCESS_FINE_LOCATION},
-                        PERMISSION_REQUEST_CODE);
-            }
-        }
-    }
-
-    private void showPairedDevices() {
+    private void startDiscoveryAndShowDevices() {
         if (bluetoothAdapter == null) {
             Toast.makeText(this, "Bluetooth not supported on this device", Toast.LENGTH_SHORT).show();
             return;
@@ -158,36 +213,51 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            Toast.makeText(this, "Bluetooth permission not granted", Toast.LENGTH_SHORT).show();
-            return;
-        }
+        discoveredDevicesList.clear();
 
+        // Seed the list with already-paired devices first
         Set<BluetoothDevice> bondedDevices = bluetoothAdapter.getBondedDevices();
-        pairedDevicesList.clear();
-        ArrayList<String> deviceNames = new ArrayList<>();
-
         for (BluetoothDevice device : bondedDevices) {
-            pairedDevicesList.add(device);
-            deviceNames.add(device.getName() + "\n" + device.getAddress());
+            discoveredDevicesList.add(device);
         }
+        refreshDeviceListAdapter();
 
-        if (deviceNames.isEmpty()) {
-            Toast.makeText(this, "No paired devices found. Pair in phone Settings first.", Toast.LENGTH_LONG).show();
+        // Now also actively search for nearby devices (paired or not)
+        if (bluetoothAdapter.isDiscovering()) {
+            bluetoothAdapter.cancelDiscovery();
         }
+        boolean started = bluetoothAdapter.startDiscovery();
+        if (!started) {
+            Toast.makeText(this, "Could not start device search", Toast.LENGTH_SHORT).show();
+        }
+    }
 
+    private void stopDiscovery() {
+        if (bluetoothAdapter != null && bluetoothAdapter.isDiscovering()) {
+            bluetoothAdapter.cancelDiscovery();
+        }
+    }
+
+    private void refreshDeviceListAdapter() {
+        ArrayList<String> deviceNames = new ArrayList<>();
+        for (BluetoothDevice device : discoveredDevicesList) {
+            String name = device.getName();
+            if (name == null) {
+                name = "Unknown device";
+            }
+            deviceNames.add(name + "\n" + device.getAddress());
+        }
         ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, deviceNames);
         deviceList.setAdapter(adapter);
     }
 
     private void startListening() {
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            Toast.makeText(this, "Bluetooth permission not granted", Toast.LENGTH_SHORT).show();
+        if (!permissionsGranted) {
             return;
         }
 
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
-            Toast.makeText(this, "Please turn on Bluetooth", Toast.LENGTH_SHORT).show();
+            statusText.setText("Status: Bluetooth is off");
             return;
         }
 
@@ -221,7 +291,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void connectToDevice(BluetoothDevice device) {
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+        if (!permissionsGranted) {
             Toast.makeText(this, "Bluetooth permission not granted", Toast.LENGTH_SHORT).show();
             return;
         }
@@ -234,8 +304,9 @@ public class MainActivity extends AppCompatActivity {
         statusText.setText("Status: Connecting...");
 
         new Thread(() -> {
+            BluetoothSocket socket = null;
             try {
-                BluetoothSocket socket = device.createInsecureRfcommSocketToServiceRecord(APP_UUID);
+                socket = device.createInsecureRfcommSocketToServiceRecord(APP_UUID);
                 socket.connect();
                 bluetoothSocket = socket;
                 outputStream = socket.getOutputStream();
@@ -244,7 +315,16 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> statusText.setText("Status: Connected"));
                 listenForMessages();
             } catch (IOException e) {
-                runOnUiThread(() -> statusText.setText("Status: Disconnected"));
+                final String errorMsg = e.getMessage();
+                try {
+                    if (socket != null) socket.close();
+                } catch (IOException closeEx) {
+                    // ignore
+                }
+                runOnUiThread(() -> {
+                    statusText.setText("Status: Disconnected");
+                    Toast.makeText(MainActivity.this, "Connection failed: " + errorMsg, Toast.LENGTH_LONG).show();
+                });
             }
         }).start();
     }
@@ -297,7 +377,7 @@ public class MainActivity extends AppCompatActivity {
     private void appendMessage(String sender, String text, int color) {
         String line = sender + ": " + text + "\n";
         SpannableString spannable = new SpannableString(line);
-        int labelEnd = sender.length() + 1; // includes the colon
+        int labelEnd = sender.length() + 1;
 
         spannable.setSpan(new ForegroundColorSpan(color), 0, labelEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         spannable.setSpan(new StyleSpan(Typeface.BOLD), 0, labelEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
@@ -318,11 +398,17 @@ public class MainActivity extends AppCompatActivity {
         bluetoothSocket = null;
         statusText.setText("Status: Disconnected");
         messageArea.append("--- Disconnected ---\n");
+        startListening();
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        try {
+            unregisterReceiver(discoveryReceiver);
+        } catch (IllegalArgumentException e) {
+            // receiver already unregistered
+        }
         try {
             if (bluetoothSocket != null) {
                 bluetoothSocket.close();
